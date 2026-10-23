@@ -59,7 +59,7 @@ def build(state):
             "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": a["toolName"],
             "gen_ai.tool.call.id": a["callId"], "gen_ai.tool.type": "function", "ga5.action.id": a["actionId"],
             "ga5.phase": a["phase"], "ga5.approval.id": a.get("approvalId"),
-            "error.type": err}, error=err, ok=a["state"] in ("succeeded", "refuted"))
+            "error.type": err}, error=err, ok=a["state"] == "succeeded")
         tool_spans.append((a, tool))
         for att in a["attempts"]:
             r = att["receipt"] or {}

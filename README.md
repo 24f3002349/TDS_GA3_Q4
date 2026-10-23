@@ -31,7 +31,13 @@ built only from stored dispatches and receipts.
 | `DB_PATH` | `incidents.sqlite3` | SQLite file (`/tmp/incidents.sqlite3` on Render) |
 | `KEEPALIVE_URL` | `RENDER_EXTERNAL_URL` | Pinged every 10 min so the free instance does not sleep |
 
-Tests: `python test_engine.py` (state machine and trace rules, no model needed) and
-`python test_local.py <base-url>` (full HTTP contract with synthetic incidents; uses the model).
+Tests:
+* `python test_engine.py`: state machine and trace rules, no model needed.
+* `python test_local.py <base-url>`: HTTP contract with synthetic incidents.
+* `python test_grader.py <base-url> <folder of incident JSON> [--parallel]`: grader-like run over captured incidents
+  (plain, 503 retry, timeout and approval scenarios; replay, conflicts, redaction and every OTLP rule).
+
+When no model answers, the plan comes from deterministic rules over the case-specific records (filler records repeat a
+template; evidence is unique), so a rate-limited free tier never produces an invalid proposal.
 
 Run locally: `pip install -r requirements.txt && python app.py` (reads `.env`, listens on `PORT`, default 8000).

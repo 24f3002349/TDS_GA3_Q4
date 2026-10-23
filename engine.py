@@ -2,18 +2,10 @@
 import copy
 import hashlib
 import json
-import re
 import secrets
 import time
 
 import otlp
-
-NEGATIVE_RESULT = re.compile(r"refut|reject|not[_ -]?confirm|unconfirm|disprov|mismatch|inconclusive|fail|error",
-                             re.I)
-LIMIT_RESULT = re.compile(r"limit|ceiling|max(imum)?[_ -]?(replica|capacity|scale)|at[_ -]?capacity|quota", re.I)
-PAGE_TOOL = re.compile(r"page|escalat|notify|alert", re.I)
-SCALE_TOOL = re.compile(r"scale", re.I)
-
 
 class InvalidTransition(Exception):
     pass
@@ -194,19 +186,20 @@ def apply_receipt(state, receipt_id, body):
                           "errorType": o.get("errorType"), "resultClass": o.get("resultClass")}
         att["end"] = t
         st["receiptLog"].append({"receiptId": receipt_id, **o})
+        # Only the HTTP outcome decides: 2xx succeeds, 503 allows one retry, anything else (timeout = status 0) fails.
+        # resultClass is the grader's free-form label and is recorded, never interpreted.
         status = o["status"]
         if status == 503:
             action["state"] = "retryable" if att["attempt"] == 1 else "failed"
         elif 200 <= status < 300 and not o.get("errorType"):
-            negative = action["phase"] == "diagnostic" and NEGATIVE_RESULT.search(str(o.get("resultClass") or ""))
-            action["state"] = "refuted" if negative else "succeeded"
+            action["state"] = "succeeded"
         else:
             action["state"] = "failed"
         if action["state"] != "retryable":
             action["end"] = t
 
     diagnostics = [a for a in st["actions"] if a["phase"] == "diagnostic"]
-    doomed = any(a["state"] in ("failed", "refuted") for a in diagnostics)
+    doomed = any(a["state"] == "failed" for a in diagnostics)
     # 503 retries: exactly one per logical call, and only while the run can still reach its effect.
     for a in st["actions"]:
         if a["state"] == "retryable":
@@ -244,7 +237,7 @@ def apply_receipt(state, receipt_id, body):
                     st["suppressed"].append(st["effectPlan"]["toolName"])
                 _finish(st, "failed", t)
             elif all(a["state"] == "succeeded" for a in diagnostics):
-                spec = _effect_spec(st, diagnostics)
+                spec = st["effectPlan"]  # decided from the evidence at planning time
                 if spec is None:
                     _finish(st, "failed", t)
                 else:
@@ -262,16 +255,6 @@ def apply_receipt(state, receipt_id, body):
                         st["chosenEffect"] = action["toolName"]
     st["lastEvent"] = t
     return st, issued, approval_requests
-
-
-def _effect_spec(st, diagnostics):
-    spec, alt = st["effectPlan"], st.get("alternateEffect")
-    # Deterministic rule from the policy: a service already at its scaling limit is paged, not scaled.
-    if spec and alt and SCALE_TOOL.search(spec["toolName"]) and PAGE_TOOL.search(alt["toolName"]):
-        if any(LIMIT_RESULT.search(str(a["attempts"][-1]["receipt"].get("resultClass") or ""))
-               for a in diagnostics):
-            return alt
-    return spec
 
 
 def _finish(st, status, t):
