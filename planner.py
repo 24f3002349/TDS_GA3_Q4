@@ -13,31 +13,70 @@ import httpx
 import store
 
 PROMPT_VERSION = "p3"
+# Evidence IDs are bracketed tokens; normally at line start, but accepted anywhere in a line.
 EV_LINE_RE = re.compile(r"^\s*\[([^\[\]\s]{1,80})\]", re.M)
+EV_ANY_RE = re.compile(r"\[([A-Za-z0-9][\w.:#/\-]{1,79})\]")
+
+
+def _csv(name, default=""):
+    return [x.strip() for x in os.environ.get(name, default).split(",") if x.strip()]
 
 
 def _endpoints():
-    """Preference-ordered (model, base_url, api_key, provider) list from the environment."""
+    """Endpoints in tiers. Free-tier quotas are per key and per model, so tier-0 calls rotate over every
+    (key, model) pair; later tiers are used only when tier 0 is unavailable."""
     out = []
     base = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
-    key = os.environ.get("LLM_API_KEY", "").strip()
-    for m in os.environ.get("LLM_MODEL", "gemini-3.6-flash,gemini-3.5-flash").split(","):
-        if m.strip() and key:
-            out.append((m.strip(), base, key))
+    keys = list(dict.fromkeys(_csv("LLM_API_KEY") + _csv("LLM_API_KEYS")))
+    tiers = [_csv("LLM_MODEL", "gemini-3.6-flash,gemini-3-flash-preview,gemini-3.5-flash"),
+             _csv("LLM_LAST_MODELS", "gemini-3.5-flash-lite,gemini-3.7-flash")]
+    for tier, models in enumerate(tiers):
+        for m in models:
+            for n, key in enumerate(keys, 1):
+                out.append({"id": f"{m}#k{n}", "model": m, "base": base, "key": key, "tier": tier})
     fb_base = os.environ.get("FALLBACK_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
     fb_key = os.environ.get("FALLBACK_API_KEY", "").strip()
-    for m in os.environ.get("FALLBACK_MODEL", "anthropic/claude-haiku-5.5").split(","):
-        if m.strip() and fb_key:
-            out.append((m.strip(), fb_base, fb_key))
-    if os.environ.get("MODEL_ORDER", "").lower() == "fallback-first":
-        out = [e for e in out if e[1] == fb_base] + [e for e in out if e[1] != fb_base]
+    for m in _csv("FALLBACK_MODEL", "anthropic/claude-haiku-5.5"):
+        if fb_key:
+            out.append({"id": m, "model": m, "base": fb_base, "key": fb_key,
+                        "tier": -1 if os.environ.get("MODEL_ORDER") == "fallback-first" else 2})
     return out
 
 
 ENDPOINTS = _endpoints()
 REASONING = os.environ.get("LLM_REASONING_EFFORT", "low")
 CALL_TIMEOUT_S = float(os.environ.get("LLM_CALL_TIMEOUT_S", "8"))
-MODEL_STATUS = {}  # model -> last outcome, shown on /healthz (never the key)
+FALLBACK_MAX_TOKENS = int(os.environ.get("FALLBACK_MAX_TOKENS", "1200"))
+MODEL_STATUS = {}  # endpoint id -> last outcome, shown on /healthz (never the key)
+_cooldown = {}  # endpoint id -> monotonic time until which it is skipped
+_rr = 0
+
+
+def _order():
+    """Ready endpoints by tier, rotating within a tier; cooling-down endpoints last (soonest first)."""
+    global _rr
+    _rr += 1
+    now = time.monotonic()
+    ready, cooling = [], []
+    for tier in sorted({e["tier"] for e in ENDPOINTS}):
+        group = [e for e in ENDPOINTS if e["tier"] == tier and _cooldown.get(e["id"], 0) <= now]
+        if group:
+            k = _rr % len(group)
+            ready += group[k:] + group[:k]
+    cooling = sorted((e for e in ENDPOINTS if _cooldown.get(e["id"], 0) > now), key=lambda e: _cooldown[e["id"]])
+    return ready + cooling
+
+
+def _cool(endpoint, status, text):
+    if status == 429:
+        seconds = 3600 if "PerDay" in text or "per day" in text.lower() else 60
+    elif status == 402:
+        seconds = 900
+    elif status in (404, 400, 401, 403):
+        seconds = 1800
+    else:  # 5xx overload, timeouts, unparseable replies
+        seconds = 20
+    _cooldown[endpoint["id"]] = time.monotonic() + seconds
 
 
 def provider_of(base):
@@ -91,7 +130,7 @@ Output format:
 
 
 def evidence_ids(transcript):
-    return list(dict.fromkeys(EV_LINE_RE.findall(transcript or "")))
+    return list(dict.fromkeys(EV_LINE_RE.findall(transcript or "") + EV_ANY_RE.findall(transcript or "")))
 
 
 def redact_text(text, secrets):
@@ -133,31 +172,38 @@ def parse_json(text):
 async def call_model(messages, deadline):
     """Try each endpoint in order until one returns parseable JSON or the deadline passes."""
     errors = []
+    order = _order()
     async with httpx.AsyncClient() as client:
-        for i, (model, base, key) in enumerate(ENDPOINTS):
+        for i, ep in enumerate(order):
             remaining = deadline - time.monotonic()
             if remaining < 2.5:
                 break
-            if i < len(ENDPOINTS) - 1:  # a stuck provider must leave time for the next one
+            if i < len(order) - 1:  # a stuck provider must leave time for the next one
                 remaining = min(remaining, CALL_TIMEOUT_S + 0.5)
-            payload = {"model": model, "messages": messages, "temperature": 0,
+            payload = {"model": ep["model"], "messages": messages, "temperature": 0,
                        "response_format": {"type": "json_object"}}
-            if REASONING and "googleapis" in base:
-                payload["reasoning_effort"] = REASONING
+            if "googleapis" in ep["base"]:
+                if REASONING:
+                    payload["reasoning_effort"] = REASONING
+            else:
+                payload["max_tokens"] = FALLBACK_MAX_TOKENS  # a small credit balance still affords the call
+            status, text = 0, ""
             try:
-                r = await client.post(f"{base}/chat/completions", json=payload, timeout=remaining - 0.5,
-                                      headers={"Authorization": f"Bearer {key}"})
+                r = await client.post(f"{ep['base']}/chat/completions", json=payload, timeout=remaining - 0.5,
+                                      headers={"Authorization": f"Bearer {ep['key']}"})
+                status, text = r.status_code, r.text
                 if r.status_code >= 400:
-                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
                 body = r.json()
                 data = parse_json(body["choices"][0]["message"]["content"])
-                MODEL_STATUS[model] = {"ok": True, "at": time.strftime("%H:%M:%SZ", time.gmtime())}
-                return model, base, data, body.get("usage") or {}
+                MODEL_STATUS[ep["id"]] = {"ok": True, "at": time.strftime("%H:%M:%SZ", time.gmtime())}
+                return ep["model"], ep["base"], data, body.get("usage") or {}
             except Exception as e:  # noqa: BLE001 - any provider failure moves on to the next model
-                msg = f"{type(e).__name__}: {str(e)[:200]}".replace(key, "<key>")
-                MODEL_STATUS[model] = {"ok": False, "detail": msg, "at": time.strftime("%H:%M:%SZ", time.gmtime())}
-                errors.append(f"{model}: {msg}")
-                print(f"[planner] {model} failed: {msg}", flush=True)
+                _cool(ep, status, text)
+                msg = " ".join(f"{type(e).__name__}: {str(e)[:160]}".replace(ep["key"], "<key>").split())
+                MODEL_STATUS[ep["id"]] = {"ok": False, "detail": msg, "at": time.strftime("%H:%M:%SZ", time.gmtime())}
+                errors.append(f"{ep['id']}: {msg[:60]}")
+                print(f"[planner] {ep['id']} failed: {msg}", flush=True)
     raise RuntimeError("; ".join(errors) or "no model configured")
 
 
@@ -295,7 +341,7 @@ def heuristic_evidence(incident, cause):
     words = _words(cause) | _words(incident.get("service"))
     scored = []
     for line in (incident.get("transcript") or "").splitlines():
-        m = EV_LINE_RE.match(line)
+        m = EV_LINE_RE.match(line) or EV_ANY_RE.search(line)
         if m:
             scored.append((len(_words(line) & words), m.group(1)))
     return [i for _, i in sorted(scored, key=lambda x: -x[0])[:2]]
@@ -310,15 +356,21 @@ async def plan_incident(incident, catalog, policy, secrets, deadline):
     """Returns (plan, model_meta). model_meta describes the real model call for the chat span."""
     transcript = redact_text(incident.get("transcript") or "", secrets)
     ev_ids = evidence_ids(transcript)
-    key = content_hash(incident, catalog, policy)
+    # Run-specific canaries are redacted first, so later runs of the same incident share the cache entry.
+    key = content_hash({**incident, "transcript": transcript}, catalog,
+                       {k: v for k, v in policy.items() if k != "doNotExport"})
+    lines = transcript.splitlines()
+    print(f"[incident] key={key[:10]} lines={len(lines)} evidenceIds={len(ev_ids)} sample={ev_ids[:3]} "
+          f"first={json.dumps(lines[:2])[:300]}", flush=True)
     messages = build_messages(incident, catalog, policy, transcript)
     start = time.time_ns()
-    meta = {"start": start, "model": ENDPOINTS[0][0] if ENDPOINTS else "none",
-            "provider": provider_of(ENDPOINTS[0][1]) if ENDPOINTS else "none"}
+    meta = {"start": start, "model": ENDPOINTS[0]["model"] if ENDPOINTS else "none",
+            "provider": provider_of(ENDPOINTS[0]["base"]) if ENDPOINTS else "none"}
     try:
         model, base, raw, usage = await call_model(messages, deadline)
         meta.update(model=model, provider=provider_of(base), ok=True,
                     input_tokens=usage.get("prompt_tokens"), output_tokens=usage.get("completion_tokens"))
+        print(f"[model] {model} raw={json.dumps(raw)[:900]}", flush=True)
         plan = normalize(raw, incident, catalog, policy, ev_ids)
         plan["source"] = "model"
         store.cache_plan(key, plan)

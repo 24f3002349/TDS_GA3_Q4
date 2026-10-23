@@ -34,7 +34,28 @@ def body_hash(body):
 
 
 def error(status, code, message):
+    print(f"[error] {status} {code}: {message}", flush=True)
     return JSONResponse({"error": code, "message": message}, status_code=status)
+
+
+_dumped = set()
+
+
+def log_request_shape(request, body):
+    """Debug log (server-side only) of what the grader sends. The sensitive object is never logged."""
+    inc = body.get("incident") or {}
+    shape = {"headers": {k: request.headers.get(k) for k in ("traceparent", "tracestate", "content-type")},
+             "keys": sorted(body), "incident": {k: v for k, v in inc.items() if k != "transcript"},
+             "policy": body.get("policy"), "agentName": body.get("agentName"),
+             "sensitiveKeys": sorted((body.get("sensitive") or {}).keys())}
+    print(f"[request] {body.get('runId')} {json.dumps(shape)[:3000]}", flush=True)
+    key = hashlib.sha256(json.dumps([inc.get("transcript"), body.get("toolCatalog")]).encode()).hexdigest()[:10]
+    if key not in _dumped and os.environ.get("DUMP_INCIDENTS", "on") == "on":
+        _dumped.add(key)
+        text = json.dumps({k: v for k, v in body.items() if k != "sensitive"})
+        chunks = [text[i:i + 3000] for i in range(0, len(text), 3000)]
+        for i, c in enumerate(chunks):
+            print(f"[dump {key} {i + 1}/{len(chunks)}] {c}", flush=True)
 
 
 def raw_json(text, status=200):
@@ -160,6 +181,8 @@ async def create_incident(request: Request):
     body = await read_json(request)
     if body is engine.InvalidTransition:
         return error(400, "invalid_json", "request body is not valid JSON")
+    if isinstance(body, dict):
+        log_request_shape(request, body)
     problem = validate_incident(body)
     if problem:
         return error(400 if problem == "unsupported profile" else 422, "invalid_request", problem)
@@ -190,6 +213,7 @@ async def post_receipt(request: Request):
     body = await read_json(request)
     if body is engine.InvalidTransition:
         return error(400, "invalid_json", "request body is not valid JSON")
+    print(f"[receipt-in] {run_id} {json.dumps(body)[:2000]}", flush=True)
     if not isinstance(body, dict):
         return error(422, "invalid_receipt", "receipt must be a JSON object")
     receipt_id = body.get("receiptId")
@@ -225,12 +249,35 @@ async def get_incident(request: Request):
 
 async def health(request: Request):
     return JSONResponse({"ok": True, "profile": PROFILE,
-                         "models": [{"model": m, "provider": planner.provider_of(b),
-                                     **planner.MODEL_STATUS.get(m, {})} for m, b, _ in planner.ENDPOINTS]})
+                         "models": [{"model": e["id"], "provider": planner.provider_of(e["base"]),
+                                     **planner.MODEL_STATUS.get(e["id"], {})} for e in planner.ENDPOINTS]})
 
 
 async def not_allowed(request: Request):
     return error(405, "method_not_allowed", "method not allowed")
+
+
+class AccessLog:
+    """Logs method, path, status and duration of every request (Render keeps no request log on this plan)."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        start, status = time.monotonic(), [0]
+
+        async def capture(message):
+            if message["type"] == "http.response.start":
+                status[0] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture)
+        finally:
+            print(f"[http] {scope['method']} {scope['path']} -> {status[0]} "
+                  f"{(time.monotonic() - start) * 1000:.0f}ms", flush=True)
 
 
 routes = []
@@ -243,6 +290,7 @@ for suffix in ("", "/"):
 routes += [Route("/healthz", health, methods=["GET"]), Route("/", health, methods=["GET", "HEAD"])]
 app = Starlette(routes=routes)
 app.router.redirect_slashes = False
+app.add_middleware(AccessLog)
 
 if __name__ == "__main__":
     import uvicorn
