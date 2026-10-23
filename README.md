@@ -22,13 +22,16 @@ built only from stored dispatches and receipts.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LLM_API_KEY` | | Primary key (Google AI Studio) |
-| `LLM_BASE_URL` | Gemini OpenAI-compatible endpoint | Any OpenAI-compatible endpoint |
-| `LLM_MODEL` | `gemini-3.6-flash,gemini-3.5-flash` | Preference order |
-| `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` / `FALLBACK_MODEL` | OpenRouter, `anthropic/claude-haiku-5.5` | Used when the primary fails |
-| `MODEL_ORDER=fallback-first` | | Try the fallback provider first |
+| `GEMINI_API_KEY` | (required) | Free Google AI Studio key (https://aistudio.google.com/apikey). Comma-separate several keys to spread free-tier quota |
+| `LLM_MODEL` | `gemini-3.6-flash,gemini-3-flash-preview,gemini-3.5-flash` | Free models, rotated per call (each has its own free quota) |
+| `LLM_LAST_MODELS` | `gemini-3.5-flash-lite` | Used only when the models above are rate-limited |
+| `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` / `FALLBACK_MODEL` | unset | Optional second provider (any OpenAI-compatible endpoint) |
 | `LLM_CALL_TIMEOUT_S` | 8 | Per-model timeout before trying the next one |
 | `PLAN_BUDGET_S` | 14 | Total planning budget (the grader allows 18 s per request) |
-| `DB_PATH` | `incidents.sqlite3` | SQLite file |
+| `DB_PATH` | `incidents.sqlite3` | SQLite file (`/tmp/incidents.sqlite3` on Render) |
+| `KEEPALIVE_URL` | `RENDER_EXTERNAL_URL` | Pinged every 10 min so the free instance does not sleep |
+
+Tests: `python test_engine.py` (state machine and trace rules, no model needed) and
+`python test_local.py <base-url>` (full HTTP contract with synthetic incidents; uses the model).
 
 Run locally: `pip install -r requirements.txt && python app.py` (reads `.env`, listens on `PORT`, default 8000).

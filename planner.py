@@ -28,9 +28,9 @@ def _endpoints():
     (key, model) pair; later tiers are used only when tier 0 is unavailable."""
     out = []
     base = os.environ.get("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
-    keys = list(dict.fromkeys(_csv("LLM_API_KEY") + _csv("LLM_API_KEYS")))
+    keys = list(dict.fromkeys(_csv("GEMINI_API_KEY") + _csv("LLM_API_KEY") + _csv("LLM_API_KEYS")))
     tiers = [_csv("LLM_MODEL", "gemini-3.6-flash,gemini-3-flash-preview,gemini-3.5-flash"),
-             _csv("LLM_LAST_MODELS", "gemini-3.5-flash-lite,gemini-3.7-flash")]
+             _csv("LLM_LAST_MODELS", "gemini-3.5-flash-lite")]
     for tier, models in enumerate(tiers):
         for m in models:
             for n, key in enumerate(keys, 1):
@@ -398,8 +398,53 @@ def normalize(plan, incident, catalog, policy, ev_ids):
         name = best_tool(effect_tools, tools, cause)
         effect = {"toolName": name, "evidence": evidence[:1],
                   "arguments": sanitize_args({}, tools.get(name, {}).get("inputSchema"), incident)}
+    effect = capacity_guard(effect, incident, tools, effect_tools, evidence, cause)
     return {"rootCause": cause, "evidence": evidence, "diagnostics": diagnostics, "effect": effect,
             "alternateEffect": effect_of(plan.get("alternateEffect"))}
+
+
+EXACT_TARGET = re.compile(r"(?i)(?:target|ceiling|limit)[^.;]{0,80}?\bexactly\s+(\d+)\s+(?:\w+\s+)?replicas")
+CURRENT_MAX = re.compile(r"(?i)replicas\s*=\s*(\d+)[^.]{0,80}?maximum\s*=\s*(\d+)")
+
+
+def capacity_guard(effect, incident, tools, effect_tools, evidence, cause):
+    """Deterministic check of capacity effects against the numbers stated in the cited evidence: an exact approved
+    target is scaled to; 'add one replica below the maximum' scales to current + 1; at the maximum the owner is paged."""
+    if not effect or not re.search(r"(?i)capacity|exhaust|saturat|pool|connection|traffic|load", str(cause)):
+        return effect
+    scale = next((n for n in effect_tools if "scale" in n.lower()), None)
+    page = next((n for n in effect_tools if "page" in n.lower()), None)
+    if not scale:
+        return effect
+    text = evidence_text(incident, set(evidence))
+    target, cite = None, None
+    m = EXACT_TARGET.search(text)
+    if m:
+        target = int(m.group(1))
+    m2 = CURRENT_MAX.search(text)
+    if m2 and target is None:
+        current, maximum = int(m2.group(1)), int(m2.group(2))
+        if current >= maximum:
+            if page and effect["toolName"] != page:
+                schema = tools.get(page, {}).get("inputSchema")
+                return {"toolName": page, "evidence": effect["evidence"],
+                        "arguments": sanitize_args({"service": incident.get("service")}, schema, incident)}
+            return effect
+        target = current + 1
+    if target is None:
+        return effect
+    for e in evidence:
+        line = evidence_text(incident, {e})
+        if EXACT_TARGET.search(line) or CURRENT_MAX.search(line):
+            cite = e
+    schema = tools.get(scale, {}).get("inputSchema") or {}
+    names = list((schema.get("properties") or {}).keys()) or list(schema.get("required") or [])
+    key = next((k for k in names if re.search(r"(?i)replica|count|target", k)), None)
+    if not key:
+        return effect
+    args = sanitize_args({"service": incident.get("service"), key: target}, schema, incident)
+    return {"toolName": scale, "arguments": args,
+            "evidence": [cite] if cite else (effect.get("evidence") or evidence[:1])}
 
 
 # ---------- deterministic fallback (used only when every model call fails and nothing is cached) ----------

@@ -33,6 +33,8 @@ def build(state):
              "attributes": _attrs({**common, **attrs})}
         if parent:
             s["parentSpanId"] = parent
+        if tr.get("tracestate"):  # continue the caller's vendor state on every span of its trace
+            s["traceState"] = tr["tracestate"]
         if links:
             s["links"] = links
         s["status"] = {"code": ERROR, "message": error} if error else {"code": 0}
