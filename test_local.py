@@ -257,11 +257,21 @@ def run(name, sc, client):
 
 
 def main():
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    parallel = "--parallel" in ONLY
+    names = [n for n in SCENARIOS if not [o for o in ONLY if o != "--parallel"] or n in ONLY]
+    started = time.monotonic()
     with httpx.Client(timeout=30) as client:
         bad = client.post(f"{BASE}/v2/incidents", json={"profile": "nope", "runId": "x" * 10})
         print("bad profile ->", bad.status_code)
-        ok = [run(n, sc, client) for n, sc in SCENARIOS.items() if not ONLY or n in ONLY]
-    print(f"\n{sum(ok)}/{len(ok)} scenarios passed")
+        if parallel:  # like the grader: every incident at once, then 2 extra copies to reach 7 runs
+            jobs = names + names[:2]
+            with ThreadPoolExecutor(len(jobs)) as pool:
+                ok = list(pool.map(lambda n: run(n, SCENARIOS[n], client), jobs))
+        else:
+            ok = [run(n, SCENARIOS[n], client) for n in names]
+    print(f"\n{sum(ok)}/{len(ok)} scenarios passed in {time.monotonic() - started:.1f}s")
 
 
 if __name__ == "__main__":
