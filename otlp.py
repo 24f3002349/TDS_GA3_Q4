@@ -3,14 +3,14 @@ tool arguments, tool results or sensitive values are ever exported."""
 import time
 
 INTERNAL, SERVER, CLIENT = 1, 2, 3
-ERROR = 2
+OK, ERROR = 1, 2
 
 
 def _value(v):
     if isinstance(v, bool):
         return {"boolValue": v}
     if isinstance(v, int):
-        return {"intValue": v}
+        return {"intValue": str(v)}  # OTLP/JSON encodes int64 as a decimal string
     if isinstance(v, float):
         return {"doubleValue": v}
     return {"stringValue": str(v)}
@@ -26,7 +26,7 @@ def build(state):
     open_end = max(time.time_ns(), state["lastEvent"])
     spans = []
 
-    def span(span_id, parent, name, kind, start, end, attrs, error=None, links=None):
+    def span(span_id, parent, name, kind, start, end, attrs, error=None, links=None, ok=False):
         end = end if end else open_end
         s = {"traceId": tr["traceId"], "spanId": span_id, "name": name, "kind": kind,
              "startTimeUnixNano": str(start), "endTimeUnixNano": str(max(end, start + 1000)),
@@ -37,7 +37,10 @@ def build(state):
             s["traceState"] = tr["tracestate"]
         if links:
             s["links"] = links
-        s["status"] = {"code": ERROR, "message": error} if error else {"code": 0}
+        if error:
+            s["status"] = {"code": ERROR, "message": error}
+        elif ok:
+            s["status"] = {"code": OK}
         spans.append(s)
         return s
 
@@ -56,7 +59,7 @@ def build(state):
             "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": a["toolName"],
             "gen_ai.tool.call.id": a["callId"], "gen_ai.tool.type": "function", "ga5.action.id": a["actionId"],
             "ga5.phase": a["phase"], "ga5.approval.id": a.get("approvalId"),
-            "error.type": err}, error=err)
+            "error.type": err}, error=err, ok=a["state"] in ("succeeded", "refuted"))
         tool_spans.append((a, tool))
         for att in a["attempts"]:
             r = att["receipt"] or {}
@@ -76,7 +79,7 @@ def build(state):
                     err = str(r["errorType"])
                 attrs["error.type"] = err
             span(att["spanId"], a["spanId"], f"POST tool/{a['toolName']}", CLIENT, att["start"], att["end"],
-                 attrs, error=err)
+                 attrs, error=err, ok=bool(r) and not err)
             spans_end.append(att["end"] or open_end)
 
     diags = [(a, s) for a, s in tool_spans if a["phase"] == "diagnostic"]
@@ -94,13 +97,13 @@ def build(state):
             "ga5.approval.id": apr["approvalId"], "ga5.action.id": apr["actionId"],
             "gen_ai.tool.name": apr["toolName"], "ga5.approval.decision": apr.get("decision"),
             "ga5.approval.nonce": apr.get("nonce"), "ga5.receipt.id": apr.get("receiptId"),
-            "ga5.receipt.nonce": apr.get("nonce")})
+            "ga5.receipt.nonce": apr.get("nonce")}, ok=apr.get("decision") is not None)
 
     span(tr["chatSpanId"], tr["agentSpanId"], "chat incident-plan", CLIENT, m["start"], m["end"], {
         "gen_ai.operation.name": "chat", "gen_ai.request.model": m["model"],
         "gen_ai.response.model": m["model"] if m.get("ok") else None, "gen_ai.provider.name": m.get("provider"),
         "gen_ai.usage.input_tokens": m.get("input_tokens"), "gen_ai.usage.output_tokens": m.get("output_tokens"),
-        "error.type": m.get("error")}, error=m.get("error"))
+        "error.type": m.get("error")}, error=m.get("error"), ok=bool(m.get("ok")))
 
     end = max(e for e in spans_end if e)
     final = state["status"] != "waiting"

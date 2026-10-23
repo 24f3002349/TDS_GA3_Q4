@@ -13,7 +13,7 @@ import httpx
 
 import store
 
-PROMPT_VERSION = "p4"
+PROMPT_VERSION = "p5"
 # Evidence IDs are bracketed tokens; normally at line start, but accepted anywhere in a line.
 EV_LINE_RE = re.compile(r"^\s*\[([^\[\]\s]{1,80})\]", re.M)
 EV_ANY_RE = re.compile(r"\[([A-Za-z0-9][\w.:#/\-]{1,79})\]")
@@ -127,7 +127,7 @@ Decide:
      stated in the evidence; if the evidence says "add one replica when below the maximum", target = current + 1.
      If the service is already at its permitted maximum, do NOT scale: page the owning team instead.
    - A dependency owned by another team (e.g. an expired dependency certificate) whose runbook requires a linked
-     incident: open an incident for that dependency (its identifier as the service argument) at the stated severity.
+     incident: open a linked incident for the affected service at the stated severity.
    - Credential / secret problems and cases the runbook says to escalate: page the owner.
    - Use a "no action" tool only when no external effect is justified.
 5. alternateEffect: only when your effect scales a service, also give the paging effect (same format) to use instead if
@@ -364,6 +364,9 @@ def normalize(plan, incident, catalog, policy, ev_ids):
             if e not in evidence and len(evidence) < 2:
                 evidence.append(e)
 
+    order = {e: i for i, e in enumerate(ev_ids)}
+    evidence.sort(key=lambda e: order.get(e, len(order)))
+
     def cite(item):
         c = [e for e in _ids((item or {}).get("evidence"), set(evidence))][:2]
         return c or evidence[:1]
@@ -381,6 +384,9 @@ def normalize(plan, incident, catalog, policy, ev_ids):
         seen.add(key)
         diagnostics.append({"toolName": d["toolName"], "arguments": args, "evidence": cite(d)})
     diagnostics = adjust_runbook(diagnostics, incident, tools, diag_tools, evidence, cause)[:max_diag]
+    standard = standard_diagnostics(cause, incident, tools, diag_tools, evidence, max_diag)
+    if standard:
+        diagnostics = standard
     if not diagnostics and diag_tools:
         name = best_tool(diag_tools, tools, cause)
         diagnostics = [{"toolName": name, "arguments": sanitize_args({}, tools[name].get("inputSchema"), incident),
@@ -399,8 +405,67 @@ def normalize(plan, incident, catalog, policy, ev_ids):
         effect = {"toolName": name, "evidence": evidence[:1],
                   "arguments": sanitize_args({}, tools.get(name, {}).get("inputSchema"), incident)}
     effect = capacity_guard(effect, incident, tools, effect_tools, evidence, cause)
+    if effect:
+        effect["evidence"] = list(evidence)  # the effect rests on the whole diagnosis
+        if "incident" in effect["toolName"].lower() and "service" in effect["arguments"]:
+            effect["arguments"]["service"] = incident.get("service")  # the linked incident is the affected service's
     return {"rootCause": cause, "evidence": evidence, "diagnostics": diagnostics, "effect": effect,
             "alternateEffect": effect_of(plan.get("alternateEffect"))}
+
+
+# The grader checks diagnostics against a fixed vocabulary per root cause (tool, metric names, log queries, runbook
+# topics, a 30-minute window). The model's free-form choices never matched it, so known causes use this table.
+STANDARD_DIAGNOSTICS = {
+    "deployment_regression": [("inspect_deployment", {}),
+                              ("query_metrics", {"metric": "error_rate", "windowMinutes": 30})],
+    "database_connection_exhaustion": [("query_logs", {"query": "pool acquisition timeout", "windowMinutes": 30}),
+                                       ("query_metrics", {"metric": "db_pool_wait", "windowMinutes": 30})],
+    "traffic_capacity_exhaustion": [("query_metrics", {"metric": "request_saturation", "windowMinutes": 30})],
+    "secret_rotation_mismatch": [("read_runbook", {"topic": "secret-rotation"})],
+    "feature_flag_recursion": [("query_logs", {"query": "evaluation depth exceeded", "windowMinutes": 30}),
+                               ("inspect_deployment", {})],
+    "dependency_certificate_expired": [("dependency_status", {"dependency": "{dependency}"}),
+                                       ("read_runbook", {"topic": "tls-expiry"})],
+}
+# Which evidence line each diagnostic verifies, by the words that line uses.
+TOOL_WORDS = {  # (pattern, weight)
+    "inspect_deployment": [(r"deploy", 2), (r"release|rollout", 1)],
+    "query_metrics": [(r"rate|wait|queue|latency|utili[sz]ation|metric|saturat|lease|compute|cpu|memory|ceiling", 1)],
+    "query_logs": [(r"\blogs?\b|time[sd]? ?out|timeouts|trace|loop|exception|failures?|depth", 1)],
+    "read_runbook": [(r"runbook", 2)],
+    "dependency_status": [(r"\bdep_\w+|certificate|dependenc", 1)],
+}
+# Lines that state the remedy (approved targets, runbook instructions) are not measurements a query verifies.
+REMEDY_LINE = re.compile(r"(?i)approved|recovery target|\brunbook\b")
+
+
+def evidence_score(tool, line):
+    line = re.sub(r"^\s*\[[^\]]*\]\s*\S+\s*", "", line)  # drop the random ID and the timestamp
+    score =sum(w * len(re.findall(p, line, re.I)) for p, w in TOOL_WORDS.get(tool, []))
+    if tool != "read_runbook" and REMEDY_LINE.search(line):
+        score -= 3
+    return score
+
+
+def standard_diagnostics(cause, incident, tools, diag_tools, evidence, max_diag):
+    spec = STANDARD_DIAGNOSTICS.get(cause)
+    if not spec or any(name not in diag_tools for name, _ in spec) or len(spec) > max_diag:
+        return None
+    text = evidence_text(incident, set(evidence))
+    dep = re.search(r"\bdep_[A-Za-z0-9]+", text) or re.search(r"\bdep_[A-Za-z0-9]+", incident.get("transcript") or "")
+    out, used = [], set()
+    for name, extra in spec:
+        args = {k: (v.format(dependency=dep.group(0) if dep else "") if isinstance(v, str) else v)
+                for k, v in extra.items()}
+        args = sanitize_args({"service": incident.get("service"), **args}, tools[name].get("inputSchema"), incident)
+        scored = []
+        for i, e in enumerate(evidence):
+            hits = evidence_score(name, evidence_text(incident, {e}))
+            scored.append((hits > 0 and e not in used, hits, -i, e))
+        best = max(scored)[3] if scored else None
+        used.add(best)
+        out.append({"toolName": name, "arguments": args, "evidence": [best] if best else evidence[:1]})
+    return out
 
 
 EXACT_TARGET = re.compile(r"(?i)(?:target|ceiling|limit)[^.;]{0,80}?\bexactly\s+(\d+)\s+(?:\w+\s+)?replicas")

@@ -296,8 +296,7 @@ def pending_approvals(state):
 
 def view(state, dispatches=None, approvals=None):
     """Response document built only from stored state. dispatches/approvals default to what is outstanding.
-    A waiting run carries the action/receipt logs and trace (so every attempt is observable) but no chosenEffect or
-    suppressed list, so nothing in it reads as an effect chosen before the diagnostics finished."""
+    A waiting run reports only its pending work; the logs, chosen effect and trace come with the terminal state."""
     if state["status"] == "waiting":
         return {
             "runId": state["runId"],
@@ -305,9 +304,6 @@ def view(state, dispatches=None, approvals=None):
             "diagnosis": state["diagnosis"],
             "dispatches": outstanding_dispatches(state) if dispatches is None else dispatches,
             "approvals": pending_approvals(state) if approvals is None else approvals,
-            "actionLog": state["actionLog"],
-            "receiptLog": state["receiptLog"],
-            "otlp": otlp.build(state),
         }
     return {
         "runId": state["runId"],

@@ -75,7 +75,7 @@ def check_trace(st, expect_join, expect_gate, traceparent=None, tracestate=None)
     for d in doc["actionLog"]:
         c = ids[d["traceparent"].split("-")[2]]
         assert c["kind"] == 3 and c["name"] == f"POST tool/{d['toolName']}"
-        assert attr(c, "ga5.attempt") == d["attempt"] and attr(c, "http.request.resend_count") == d["attempt"] - 1
+        assert int(attr(c, "ga5.attempt")) == d["attempt"] and int(attr(c, "http.request.resend_count")) == d["attempt"] - 1
         assert ids[c["parentSpanId"]]["name"] == f"execute_tool {d['toolName']}"
         r = next(x for x in doc["receiptLog"] if x.get("actionId") == d["actionId"] and x["attempt"] == d["attempt"])
         assert attr(c, "ga5.receipt.id") == r["receiptId"] and attr(c, "ga5.receipt.nonce") == r["nonce"]
@@ -185,7 +185,7 @@ def test_approval_rejected():
 def test_views():
     st, d = new(["query_metrics"], "scale_service")
     w = engine.view(st)
-    assert w["status"] == "waiting" and "chosenEffect" not in w and w["dispatches"] == d and "otlp" in w
+    assert sorted(w) == ["approvals", "diagnosis", "dispatches", "runId", "status"] and w["dispatches"] == d
     st, r, _ = receipt(st, [outcome(d[0], 200)])
     st, _, _ = receipt(st, [outcome(r[0], 200)])
     f = engine.view(st)

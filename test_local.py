@@ -143,8 +143,8 @@ def verify_trace(final, tp_header, errors):
         s = ids.get(sid)
         check(s and s["kind"] == 3 and s["name"] == f"POST tool/{d['toolName']}", f"client span for {sid}", errors)
         if s:
-            check(attr(s, "ga5.attempt") == d["attempt"], "attempt attr", errors)
-            check(attr(s, "http.request.resend_count") == d["attempt"] - 1, "resend count", errors)
+            check(int(attr(s, "ga5.attempt")) == d["attempt"], "attempt attr", errors)
+            check(int(attr(s, "http.request.resend_count")) == d["attempt"] - 1, "resend count", errors)
             parent = ids.get(s["parentSpanId"])
             check(parent and parent["name"] == f"execute_tool {d['toolName']}" and
                   attr(parent, "ga5.action.id") == d["actionId"], "client parent is execute_tool", errors)
