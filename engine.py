@@ -295,14 +295,22 @@ def pending_approvals(state):
 
 
 def view(state, dispatches=None, approvals=None):
-    """Response document built only from stored state. dispatches/approvals default to what is outstanding."""
-    final = state["status"] != "waiting"
+    """Response document built only from stored state. dispatches/approvals default to what is outstanding.
+    A waiting run reports only pending work, so nothing in it reads as an effect chosen before diagnostics."""
+    if state["status"] == "waiting":
+        return {
+            "runId": state["runId"],
+            "status": state["status"],
+            "diagnosis": state["diagnosis"],
+            "dispatches": outstanding_dispatches(state) if dispatches is None else dispatches,
+            "approvals": pending_approvals(state) if approvals is None else approvals,
+        }
     return {
         "runId": state["runId"],
         "status": state["status"],
         "diagnosis": state["diagnosis"],
-        "dispatches": [] if final else (outstanding_dispatches(state) if dispatches is None else dispatches),
-        "approvals": [] if final else (pending_approvals(state) if approvals is None else approvals),
+        "dispatches": [],
+        "approvals": [],
         "chosenEffect": state["chosenEffect"],
         "suppressed": state["suppressed"],
         "actionLog": state["actionLog"],

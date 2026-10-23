@@ -190,7 +190,6 @@ def run(name, sc, client):
         rid = f"rcpt-{n}-{uuid.uuid4().hex[:6]}"
         if state["approvals"]:
             a = state["approvals"][0]
-            eff = [x for x in state["actionLog"]]
             receipt = {"receiptId": rid, "approvals": [{"approvalId": a["approvalId"], "decision": "approved",
                                                         "nonce": str(uuid.uuid4())}]}
             print(f"   approval request {a['toolName']} digest ok? (checked after dispatch)")

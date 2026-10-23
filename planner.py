@@ -7,12 +7,13 @@ import json
 import os
 import re
 import time
+from datetime import datetime
 
 import httpx
 
 import store
 
-PROMPT_VERSION = "p3"
+PROMPT_VERSION = "p4"
 # Evidence IDs are bracketed tokens; normally at line start, but accepted anywhere in a line.
 EV_LINE_RE = re.compile(r"^\s*\[([^\[\]\s]{1,80})\]", re.M)
 EV_ANY_RE = re.compile(r"\[([A-Za-z0-9][\w.:#/\-]{1,79})\]")
@@ -103,24 +104,39 @@ Reading the transcript:
 Decide:
 1. rootCause: exactly one string from allowedRootCauses, copied verbatim.
 2. evidence: 2 to 4 distinct evidence IDs (verbatim, without brackets) of the lines that most directly prove it.
+   Generic filler (support-channel guesses, verifier notes, old postmortems, forecasts, unrelated maintenance, other
+   services, "VERIFIED" labels from other services) is never evidence. Cite the specific incident-window findings.
 3. diagnostics: the MINIMUM set of read-only diagnostic calls (1..policy.maximumDiagnostics) needed to confirm the
    root cause before acting, using only catalog tools that are NOT in policy.effectTools. One call is often enough. Use
-   two or three only when the decision rests on independent facts that each need their own check (for example the
-   suspect change AND its measured impact, or the saturation AND the scaling ceiling when that decides the effect).
+   two or three only when the decision rests on independent facts that each need their own check. Pick the tool that
+   directly verifies the decisive evidence:
+   - a suspect release / rollout -> the deployment-inspection tool
+   - a named upstream dependency (e.g. dep_...) -> the dependency-status tool with that dependency identifier
+   - evidence saying the runbook is required / must be consulted before acting -> the runbook tool (include it). If
+     the evidence already quotes what the runbook says, do NOT read the runbook again.
+   - saturation, pool waits, queue depth, latency, replicas -> the metrics tool
+   - error/log patterns, recursive traces, authentication failures -> the logs tool
    Never investigate rejected hypotheses or other services, and never repeat a call. Each diagnostic cites 1-2 IDs from
    your evidence list that it verifies.
 4. effect: exactly one remediation tool from policy.effectTools that addresses the root cause; cite 1-2 IDs from your
    evidence list.
-   - If the service is already at its permitted/maximum scaling limit (max replicas, quota or ceiling reached), do NOT
-     scale: page the owner / on-call instead. Scale only when there is headroom and the cause is capacity/load.
-   - Rollback / disable targets (service, deployment, version, release, feature flag) must be exactly the ones the
-     evidence implicates, using the identifiers and semantics described by the tool's inputSchema.
+   - Bad release: roll back the service; "release" is the last known-good release to restore (the previous healthy
+     release, e.g. the one a healthy holdback still runs), never the faulty new release.
+   - Feature flag at fault: disable exactly that flag on the affected service.
+   - Capacity / connection-pool exhaustion with headroom: scale the service to the exact approved target or ceiling
+     stated in the evidence; if the evidence says "add one replica when below the maximum", target = current + 1.
+     If the service is already at its permitted maximum, do NOT scale: page the owning team instead.
+   - A dependency owned by another team (e.g. an expired dependency certificate) whose runbook requires a linked
+     incident: open an incident for that dependency (its identifier as the service argument) at the stated severity.
+   - Credential / secret problems and cases the runbook says to escalate: page the owner.
+   - Use a "no action" tool only when no external effect is justified.
 5. alternateEffect: only when your effect scales a service, also give the paging effect (same format) to use instead if
    a diagnostic reveals the scaling limit is reached; otherwise null.
 
-Arguments: follow each tool's inputSchema exactly (property names, types, enums, required fields). Copy identifiers
-verbatim from the incident and transcript (service names, deployment/version IDs, flag keys, metric names, regions,
-time windows, owners/teams). Include every required property; add optional ones only when the incident grounds them.
+Arguments: provide every required property of the tool's inputSchema and nothing else (no optional extras). Copy
+identifiers verbatim from the incident and transcript (service, release, flag, dependency IDs). Severity values use the
+incident's severity string (e.g. "SEV-1"). Window lengths are integer minutes covering the evidence timestamps.
+Replica counts are integers. Evidence IDs are copied exactly, including their "ev_" prefix.
 
 Output format:
 {"analysis":"<=80 words of reasoning","rootCause":"...","evidence":["..."],
@@ -237,29 +253,87 @@ def _coerce(value, spec):
     return value
 
 
-def sanitize_args(args, schema, incident):
+INT_KEY = re.compile(r"(?i)(replicas|count|minutes|seconds|hours|window|limit|size)")
+WINDOWS = [15, 30, 60, 120, 180, 240, 360, 720, 1440]
+
+
+def sanitize_args(args, schema, incident, hints=None):
+    """Keep exactly the schema's properties (or, when the schema lists only required keys, exactly those keys)."""
     args = args if isinstance(args, dict) else {}
     schema = schema if isinstance(schema, dict) else {}
-    props = schema.get("properties")
-    if isinstance(props, dict) and props:
-        lower = {k.lower(): k for k in props}
-        out = {}
-        for k, v in args.items():
-            name = k if k in props else lower.get(str(k).lower())
-            if name and v is not None:
-                out[name] = _coerce(v, props[name])
-    else:
-        out = {k: v for k, v in args.items() if v is not None}
-    for req in schema.get("required") or []:
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = [r for r in schema.get("required") or [] if isinstance(r, str)]
+    allowed = list(props) or required
+    lower = {k.lower(): k for k in allowed}
+    out = {}
+    for k, v in args.items():
+        name = (k if k in allowed else lower.get(str(k).lower())) if allowed else k
+        if name and v is not None:
+            out[name] = _coerce(v, props.get(name, {}))
+            if INT_KEY.search(name) and isinstance(out[name], str) and re.fullmatch(r"\d+", out[name].strip()):
+                out[name] = int(out[name].strip())
+    for k, v in (hints or {}).items():
+        if k in allowed:
+            out[k] = v
+    for req in required:
         if req not in out and re.fullmatch(r"(?i)(service|service_?name|target_?service)", req):
             out[req] = incident.get("service")
+        elif req not in out and req.lower() == "severity" and incident.get("severity"):
+            out[req] = incident["severity"]
     return out
+
+
+def window_minutes(transcript, ids):
+    """Bounded query window: the smallest standard window covering the cited evidence timestamps."""
+    stamps = []
+    for line in (transcript or "").splitlines():
+        m = re.match(r"\s*\[([^\]]+)\]\s+(\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?)", line)
+        if m and m.group(1) in ids:
+            try:
+                stamps.append(datetime.fromisoformat(m.group(2)))
+            except ValueError:
+                pass
+    span = (max(stamps) - min(stamps)).total_seconds() / 60 if len(stamps) > 1 else 0
+    return next((w for w in WINDOWS if w >= span), WINDOWS[-1])
+
+
+RUNBOOK_REQUIRED = re.compile(r"(?i)runbook (is|was) required|must (read|consult|follow) the runbook|"
+                              r"runbook must be (read|consulted)|requires? (reading|consulting) the runbook")
+RUNBOOK_QUOTED = re.compile(r"(?i)\brunbook\s*:|the runbook (assigns|says|states|requires|directs)")
+
+
+def evidence_text(incident, ids):
+    out = []
+    for line in (incident.get("transcript") or "").splitlines():
+        m = EV_LINE_RE.match(line) or EV_ANY_RE.search(line)
+        if m and m.group(1) in ids:
+            out.append(line)
+    return "\n".join(out)
+
+
+def adjust_runbook(diagnostics, incident, tools, diag_tools, evidence, cause):
+    """Deterministic guard from the cited evidence: a runbook declared mandatory before acting is read; a runbook
+    whose instruction is already quoted in the evidence is not read again."""
+    runbook = next((n for n in diag_tools if "runbook" in n.lower()), None)
+    if not runbook:
+        return diagnostics
+    text = evidence_text(incident, set(evidence))
+    has = any(d["toolName"] == runbook for d in diagnostics)
+    if RUNBOOK_REQUIRED.search(text) and not has:
+        line_id = next((e for e in evidence if RUNBOOK_REQUIRED.search(evidence_text(incident, {e}))), evidence[0])
+        args = sanitize_args({"topic": str(cause).replace("_", " ")}, tools[runbook].get("inputSchema"), incident)
+        diagnostics = diagnostics + [{"toolName": runbook, "arguments": args, "evidence": [line_id]}]
+    elif has and RUNBOOK_QUOTED.search(text) and not RUNBOOK_REQUIRED.search(text) and len(diagnostics) > 1:
+        diagnostics = [d for d in diagnostics if d["toolName"] != runbook]
+    return diagnostics
 
 
 def _ids(value, allowed):
     out = []
     for v in value if isinstance(value, list) else []:
         v = str(v).strip().strip("[]")
+        if v not in allowed and f"ev_{v}" in allowed:  # the model sometimes drops the prefix
+            v = f"ev_{v}"
         if v in allowed and v not in out:
             out.append(v)
     return out
@@ -294,17 +368,19 @@ def normalize(plan, incident, catalog, policy, ev_ids):
         c = [e for e in _ids((item or {}).get("evidence"), set(evidence))][:2]
         return c or evidence[:1]
 
+    window = window_minutes(incident.get("transcript"), set(evidence))
+    hints = {k: window for k in ("windowMinutes", "window_minutes", "minutes")}
     diagnostics, seen = [], set()
     for d in plan.get("diagnostics") or []:
         if not isinstance(d, dict) or d.get("toolName") not in diag_tools:
             continue
-        args = sanitize_args(d.get("arguments"), tools[d["toolName"]].get("inputSchema"), incident)
+        args = sanitize_args(d.get("arguments"), tools[d["toolName"]].get("inputSchema"), incident, hints)
         key = json.dumps([d["toolName"], args], sort_keys=True)
         if key in seen:
             continue
         seen.add(key)
         diagnostics.append({"toolName": d["toolName"], "arguments": args, "evidence": cite(d)})
-    diagnostics = diagnostics[:max_diag]
+    diagnostics = adjust_runbook(diagnostics, incident, tools, diag_tools, evidence, cause)[:max_diag]
     if not diagnostics and diag_tools:
         name = best_tool(diag_tools, tools, cause)
         diagnostics = [{"toolName": name, "arguments": sanitize_args({}, tools[name].get("inputSchema"), incident),
