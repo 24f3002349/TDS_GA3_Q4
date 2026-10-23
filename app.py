@@ -193,7 +193,8 @@ async def create_incident(request: Request):
         if existing:
             if existing["body_hash"] != digest:
                 return error(409, "conflict", "runId already exists with different content")
-            return raw_json(existing["first_response"])
+            # An exact replay reads the stored state: the same document a GET returns (terminal once finished).
+            return raw_json(encode(engine.view(existing["state"]), existing["secrets"]))
         secrets = collect_secrets(body)
         incident = body["incident"]
         plan, meta = await planner.plan_incident(incident, body["toolCatalog"], body["policy"], secrets, deadline)
@@ -229,6 +230,8 @@ async def post_receipt(request: Request):
         if prior:
             if prior["body_hash"] != digest:
                 return error(409, "conflict", "receiptId already used with different content")
+            if run["state"]["status"] != "waiting":  # finished run: the replay returns the stored terminal state
+                return raw_json(encode(engine.view(run["state"]), run["secrets"]))
             return raw_json(prior["response"])
         try:
             state, issued, approvals = engine.apply_receipt(run["state"], receipt_id, body)

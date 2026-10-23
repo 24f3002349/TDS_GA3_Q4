@@ -238,7 +238,10 @@ def run(name, sc, client):
     # receipt replay and conflict
     receipt, text = first_receipt
     r = client.post(f"{BASE}/v2/incidents/{run_id}/receipts", json=receipt)
-    check(r.status_code == 200 and r.text == text, "receipt replay identical", errors)
+    terminal = client.get(f"{BASE}/v2/incidents/{run_id}").text
+    check(r.status_code == 200 and r.text == terminal, "receipt replay returns terminal state", errors)
+    check(client.post(f"{BASE}/v2/incidents", json=body, headers=headers).text == terminal,
+          "POST replay returns terminal state", errors)
     bad = json.loads(json.dumps(receipt))
     (bad.get("outcomes") or bad.get("approvals"))[0]["nonce"] = str(uuid.uuid4())
     check(client.post(f"{BASE}/v2/incidents/{run_id}/receipts", json=bad).status_code == 409,

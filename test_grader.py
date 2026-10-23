@@ -154,13 +154,16 @@ def run_one(path, scenario, with_trace):
         for e in final["receiptLog"]:
             check("receiptId" in e and "nonce" in e, "receiptLog entry shape")
 
-        # replay, conflicts, invalid input
+        # durability: every exact replay of a finished run and every later GET return the same terminal JSON
+        get_text = c.get(f"{BASE}/v2/incidents/{body['runId']}").text
         r2 = c.post(f"{BASE}/v2/incidents", json=body, headers=headers)
-        check(r2.status_code == 200 and r2.text == first_text, "POST replay not identical")
+        check(r2.status_code == 200 and r2.text == get_text, "POST replay != terminal state")
         if receipts:
-            rc, txt = receipts[0]
-            r3 = c.post(f"{BASE}/v2/incidents/{body['runId']}/receipts", json=rc)
-            check(r3.status_code == 200 and r3.text == txt, "receipt replay not identical")
+            for rc, _ in (receipts[0], receipts[-1]):
+                r3 = c.post(f"{BASE}/v2/incidents/{body['runId']}/receipts", json=rc)
+                check(r3.status_code == 200 and r3.text == get_text, "receipt replay != terminal state")
+            check(c.get(f"{BASE}/v2/incidents/{body['runId']}").text == get_text, "later GET differs")
+            rc = receipts[0][0]
             bad = json.loads(json.dumps(rc))
             (bad.get("outcomes") or bad.get("approvals"))[0]["nonce"] = str(uuid.uuid4())
             check(c.post(f"{BASE}/v2/incidents/{body['runId']}/receipts", json=bad).status_code == 409,
