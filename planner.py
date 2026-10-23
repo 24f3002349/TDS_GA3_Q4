@@ -47,7 +47,7 @@ def _endpoints():
 
 ENDPOINTS = _endpoints()
 REASONING = os.environ.get("LLM_REASONING_EFFORT", "low")
-CALL_TIMEOUT_S = float(os.environ.get("LLM_CALL_TIMEOUT_S", "8"))
+CALL_TIMEOUT_S = float(os.environ.get("LLM_CALL_TIMEOUT_S", "5"))
 FALLBACK_MAX_TOKENS = int(os.environ.get("FALLBACK_MAX_TOKENS", "1200"))
 MODEL_STATUS = {}  # endpoint id -> last outcome, shown on /healthz (never the key)
 _cooldown = {}  # endpoint id -> monotonic time until which it is skipped

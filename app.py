@@ -24,7 +24,7 @@ import planner
 import store
 
 PROFILE = "ga5-incident-agent/v2"
-PLAN_BUDGET_S = float(os.environ.get("PLAN_BUDGET_S", "14"))
+PLAN_BUDGET_S = float(os.environ.get("PLAN_BUDGET_S", "10"))
 MAX_BYTES = 768 * 1024
 TRACEPARENT_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})(-.*)?$")
 _locks: dict[str, asyncio.Lock] = {}
